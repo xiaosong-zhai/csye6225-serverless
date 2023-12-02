@@ -4,6 +4,7 @@ import com.amazonaws.services.dynamodbv2.AmazonDynamoDB;
 import com.amazonaws.services.dynamodbv2.AmazonDynamoDBClientBuilder;
 import com.amazonaws.services.dynamodbv2.model.AttributeValue;
 import com.amazonaws.services.dynamodbv2.model.PutItemRequest;
+import com.amazonaws.services.dynamodbv2.model.ResourceNotFoundException;
 import com.amazonaws.services.lambda.runtime.Context;
 import com.amazonaws.services.lambda.runtime.RequestHandler;
 import com.amazonaws.services.lambda.runtime.events.SNSEvent;
@@ -29,13 +30,12 @@ import java.util.Map;
  */
 public class SnsEventHandler implements RequestHandler<SNSEvent,String> {
 
+    private static final String FILE_PATH = "/tmp";
+    private static final String PROJECT_ID = "csye6225-demo-406000";
     private static final String DYNAMODB_TABLE_NAME = "emailTrackingTable";
 
     @Override
     public String handleRequest(SNSEvent snsEvent, Context context) {
-        String filePath = "/tmp";
-        String projectId = "csye6225-demo-406000";
-
         try {
             context.getLogger().log("Received SNS event: " + snsEvent);
             // get the message
@@ -55,99 +55,103 @@ public class SnsEventHandler implements RequestHandler<SNSEvent,String> {
             String fileName = extractFileNameFromURL(submissionUrl);
             context.getLogger().log("fileName: " + fileName);
 
-
-            // download the file to resources and upload to google cloud storage
-            try{
-                // download the file from the url
-                downloadHttpUrl(submissionUrl, filePath, fileName);
-                context.getLogger().log("downloaded file: " + filePath + "/" + fileName);
-
-                // get google cloud storage credentials from lambda environment variables
-                String gcsCredentialsString = System.getenv("gcpCredentialsSecret");
-
-                // base64 decode the credentials to json string
-                byte[] decode = Base64.getDecoder().decode(gcsCredentialsString);
-                gcsCredentialsString = new String(decode, StandardCharsets.UTF_8);
-
-                // to json object
-                JsonObject gcsCredentialsJson = JsonParser.parseString(gcsCredentialsString).getAsJsonObject();
-
-                // convert gcsCredentialsJson to json file
-                File gcsCredentialsFile = new File(filePath + "/gcsCredentials.json");
-                FileUtils.writeStringToFile(gcsCredentialsFile, gcsCredentialsJson.toString(), StandardCharsets.UTF_8);
-                context.getLogger().log("created gcsCredentialsFile");
-
-                GoogleCredentials credentials = GoogleCredentials
-                        .fromStream(new FileInputStream(gcsCredentialsFile))
-                        .createScoped(Lists.newArrayList("https://www.googleapis.com/auth/cloud-platform"));
-                context.getLogger().log("created credentials");
-
-                // get the bucket name
-                String bucketName = getBucketName(credentials, projectId);
-                context.getLogger().log("bucketName: " + bucketName);
-                // upload the file to GCS
-                uploadObject(projectId, bucketName, fileName, filePath, credentials);
-                context.getLogger().log("uploaded file: " + filePath + "/" + fileName);
-
-                // get the object details
-                Map<String, String> objectDetails = getObjectDetails(credentials, projectId, bucketName, fileName);
-                String objectName = objectDetails.get("name");
-                String contentType = objectDetails.get("contentType");
-                String size = objectDetails.get("size");
-                context.getLogger().log("objectName: " + objectName);
-                context.getLogger().log("contentType: " + contentType);
-                context.getLogger().log("size: " + size);
-
-                // send mail to user
-                String apiKay = System.getenv("apiKay");
-                MailSender.sendMail(apiKay, userEmail, "Your submission has been downloaded" + "\n" +
-                        "objectName: " + objectName + "\n" +
-                        "contentType: " + contentType + "\n" +
-                        "size: " + size);
-                String status = "success";
-                context.getLogger().log("sent mail to user: " + userEmail);
-
-                // update dynamodb
-                trackEmailStatus(userEmail,status);
-
-            }catch (Exception e){
-                context.getLogger().log("Error downloading file: " + e);
-                String status = "failed";
-                String apiKey = System.getenv("apiKey");
-                trackEmailStatus(userEmail,status);
-                MailSender.sendMail(apiKey, userEmail, "Your submission download failed. The reason is: " + e);
-                e.printStackTrace();
-            }
+            // process the submission
+            processSubmission(submissionUrl, userEmail, fileName, context);
             return "SNS event handled";
         } catch (Exception e) {
             context.getLogger().log("Error handling SNS event: " + e);
-            throw e;
+            return "Error";
         }
     }
 
-    public void trackEmailStatus(String userEmail, String status) {
+    private void processSubmission(String submissionUrl, String userEmail, String fileName, Context context) {
+        try {
+            boolean downloadSuccessful = downloadFile(submissionUrl, fileName, context);
+            if (downloadSuccessful) {
+                GoogleCredentials credentials = getGoogleCredentials(context);
+                String bucketName = getBucketName(credentials, context);
+                uploadObject(bucketName, fileName, credentials);
+
+                Map<String, String> objectDetails = getObjectDetails(credentials, bucketName, fileName);
+                boolean emailSent = sendSuccessEmail(userEmail, objectDetails, context);
+                trackEmailStatus(userEmail, emailSent ? "success" : "failed", context);
+            } else {
+                sendFailureEmail(userEmail, context);
+                trackEmailStatus(userEmail, "failed", context);
+            }
+        } catch (Exception e) {
+            context.getLogger().log("Error processing submission: " + e.getMessage());
+            sendFailureEmail(userEmail, context);
+            trackEmailStatus(userEmail, "failed", context);
+        }
+    }
+
+    private GoogleCredentials getGoogleCredentials(Context context) {
+        try {
+            // get google cloud storage credentials from lambda environment variables
+            String gcsCredentialsString = System.getenv("gcpCredentialsSecret");
+
+            // base64 decode the credentials to json string
+            byte[] decode = Base64.getDecoder().decode(gcsCredentialsString);
+            gcsCredentialsString = new String(decode, StandardCharsets.UTF_8);
+
+            // to json object
+            JsonObject gcsCredentialsJson = JsonParser.parseString(gcsCredentialsString).getAsJsonObject();
+
+            // convert gcsCredentialsJson to json file
+            File gcsCredentialsFile = new File(FILE_PATH + "/gcsCredentials.json");
+            FileUtils.writeStringToFile(gcsCredentialsFile, gcsCredentialsJson.toString(), StandardCharsets.UTF_8);
+            context.getLogger().log("created gcsCredentialsFile");
+
+            GoogleCredentials credentials = GoogleCredentials
+                    .fromStream(new FileInputStream(gcsCredentialsFile))
+                    .createScoped(Lists.newArrayList("https://www.googleapis.com/auth/cloud-platform"));
+            context.getLogger().log("created credentials");
+            return credentials;
+        } catch (Exception e) {
+            context.getLogger().log("Error getting google credentials: " + e.getMessage());
+            e.printStackTrace();
+            return null;
+        }
+    }
+
+    private void trackEmailStatus(String userEmail, String status, Context context) {
         AmazonDynamoDB ddb = AmazonDynamoDBClientBuilder.defaultClient();
-        Map<String, AttributeValue> item = new HashMap<>();
-        item.put("UserEmail", new AttributeValue(userEmail));
+        HashMap<String, AttributeValue> item = new HashMap<>();
+        item.put("email", new AttributeValue(userEmail));
+        item.put("timestamp", new AttributeValue().withN(Long.toString(System.currentTimeMillis())));
         item.put("Status", new AttributeValue(status));
-        item.put("Timestamp", new AttributeValue().withN(Long.toString(System.currentTimeMillis())));
         PutItemRequest putItemRequest = new PutItemRequest()
                 .withTableName(DYNAMODB_TABLE_NAME)
                 .withItem(item);
-        ddb.putItem(putItemRequest);
+        try {
+            ddb.putItem(putItemRequest);
+            System.out.println( DYNAMODB_TABLE_NAME +" was successfully updated");
+            context.getLogger().log("DynamoDB table updated");
+
+        } catch (ResourceNotFoundException e) {
+            System.err.format("Error: The Amazon DynamoDB table \"%s\" can't be found.\n", DYNAMODB_TABLE_NAME);
+            System.err.println("Be sure that it exists and that you've typed its name correctly!");
+            context.getLogger().log("Error: The Amazon DynamoDB table \"%s\" can't be found.\n" + DYNAMODB_TABLE_NAME);
+            System.exit(1);
+        } catch (Exception e) {
+            System.err.println("Error: " + e.getMessage());
+            context.getLogger().log("Error: " + e.getMessage());
+            System.exit(1);
+        }
     }
 
-    public static String getBucketName(GoogleCredentials credentials, String projectId) {
+    private static String getBucketName(GoogleCredentials credentials, Context context) {
         Storage storage = StorageOptions.newBuilder()
                 .setCredentials(credentials)
-                .setProjectId(projectId)
+                .setProjectId(SnsEventHandler.PROJECT_ID)
                 .build()
                 .getService();
         System.out.println("storage: " + storage);
 
         String bucketName = "";
         // list buckets in the project
-        System.out.println("My buckets:");
+        context.getLogger().log("My buckets:");
         for (Bucket bucket : storage.list().iterateAll()) {
             System.out.println(bucket.toString());
             if (bucket.getName().startsWith("csye6225-")) {
@@ -157,14 +161,15 @@ public class SnsEventHandler implements RequestHandler<SNSEvent,String> {
         return bucketName;
     }
 
-    public static Map<String,String> getObjectDetails(GoogleCredentials credentials,String projectId, String bucketName, String objectName) {
+    private static Map<String,String> getObjectDetails(GoogleCredentials credentials, String bucketName, String objectName) {
         Storage storage = StorageOptions.newBuilder()
                 .setCredentials(credentials)
-                .setProjectId(projectId)
+                .setProjectId(SnsEventHandler.PROJECT_ID)
                 .build()
                 .getService();
 
         Map<String,String> map = new HashMap<>();
+
         BlobId blobId = BlobId.of(bucketName, objectName);
         Blob blob = storage.get(blobId);
         if (blob != null) {
@@ -181,7 +186,7 @@ public class SnsEventHandler implements RequestHandler<SNSEvent,String> {
     }
 
     private static String extractFileNameFromURL(String fileUrl) {
-        // Check if URL is null or empty
+        // Check if the URL is null or empty
         if (fileUrl == null || fileUrl.isEmpty()) {
             return "";
         }
@@ -191,25 +196,53 @@ public class SnsEventHandler implements RequestHandler<SNSEvent,String> {
         return parts[parts.length - 1];
     }
 
-    private void downloadHttpUrl(String submissionUrl, String filePath, String fileName) {
+    private boolean downloadFile(String submissionUrl, String fileName, Context context) {
         try {
             URL httpurl = new URL(submissionUrl);
-            File dirfile = new File(filePath);
+            File dirfile = new File(FILE_PATH);
             if (!dirfile.exists()) {
                 dirfile.mkdirs();
             }
-            FileUtils.copyURLToFile(httpurl, new File(filePath + "/" + fileName));
-
+            FileUtils.copyURLToFile(httpurl, new File(FILE_PATH + "/" + fileName));
+            context.getLogger().log("Downloaded file: " + FILE_PATH + "/" + fileName);
+            return true;
         } catch (Exception e) {
+            context.getLogger().log("Error downloading file: " + e.getMessage());
+            e.printStackTrace();
+            return false;
+        }
+    }
+
+    private boolean sendSuccessEmail(String userEmail, Map<String, String> objectDetails, Context context) {
+        try {
+            String apiKay = System.getenv("apiKay");
+            MailSender.sendMail(apiKay, userEmail, "Your submission has been downloaded" + "\n" +
+                    "objectName: " + objectDetails.get("name") + "\n" +
+                    "contentType: " + objectDetails.get("contentType") + "\n" +
+                    "size: " + objectDetails.get("size"));
+            context.getLogger().log("Sent mail to user: " + userEmail);
+            return true;
+        } catch (Exception e) {
+            context.getLogger().log("Error sending email: " + e.getMessage());
+            e.printStackTrace();
+            return false;
+        }
+    }
+
+    private void sendFailureEmail(String userEmail, Context context) {
+        try {
+            String apiKey = System.getenv("apiKey");
+            MailSender.sendMail(apiKey, userEmail, "Your submission download failed.");
+            context.getLogger().log("Sent failure mail to user: " + userEmail);
+        } catch (Exception e) {
+            context.getLogger().log("Error sending failure email: " + e.getMessage());
             e.printStackTrace();
         }
     }
 
-    public static void uploadObject(String projectId,
-                                    String bucketName,
-                                    String objectName,
-                                    String filePath,
-                                    GoogleCredentials credentials) throws IOException {
+    private static void uploadObject(String bucketName,
+                                     String objectName,
+                                     GoogleCredentials credentials) throws IOException {
         // The ID of your GCP project
         // String projectId = "your-project-id";
 
@@ -225,7 +258,7 @@ public class SnsEventHandler implements RequestHandler<SNSEvent,String> {
         // Instantiate a Google Cloud Storage client
         Storage storage = StorageOptions.newBuilder()
                 .setCredentials(credentials)
-                .setProjectId(projectId)
+                .setProjectId(SnsEventHandler.PROJECT_ID)
                 .build()
                 .getService();
 
@@ -240,7 +273,7 @@ public class SnsEventHandler implements RequestHandler<SNSEvent,String> {
             // For a target object that does not yet exist, set the DoesNotExist precondition.
             // This will cause the request to fail if the object is created before the request runs.
             precondition = Storage.BlobWriteOption.doesNotExist();
-            System.out.println("File " + filePath + " uploaded to bucket " + bucketName + " as " + objectName);
+            System.out.println("File " + SnsEventHandler.FILE_PATH + " uploaded to bucket " + bucketName + " as " + objectName);
         } else {
             // If the destination already exists in your bucket, instead set a generation-match
             // precondition. This will cause the request to fail if the existing object's generation
@@ -248,11 +281,11 @@ public class SnsEventHandler implements RequestHandler<SNSEvent,String> {
             precondition =
                     Storage.BlobWriteOption.generationMatch(
                             storage.get(bucketName, objectName).getGeneration());
-            System.out.println("File " + filePath + " uploaded to bucket " + bucketName + " as " + objectName + " with precondition");
+            System.out.println("File " + SnsEventHandler.FILE_PATH + " uploaded to bucket " + bucketName + " as " + objectName + " with precondition");
         }
-        storage.createFrom(blobInfo, Paths.get(filePath + "/" + objectName), precondition);
+        storage.createFrom(blobInfo, Paths.get(SnsEventHandler.FILE_PATH + "/" + objectName), precondition);
 
         System.out.println(
-                "File " + filePath + " uploaded to bucket " + bucketName + " as " + objectName);
+                "File " + SnsEventHandler.FILE_PATH + " uploaded to bucket " + bucketName + " as " + objectName);
     }
 }
