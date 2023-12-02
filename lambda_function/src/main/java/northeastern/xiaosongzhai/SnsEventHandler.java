@@ -2,9 +2,10 @@ package northeastern.xiaosongzhai;
 
 import com.amazonaws.services.dynamodbv2.AmazonDynamoDB;
 import com.amazonaws.services.dynamodbv2.AmazonDynamoDBClientBuilder;
-import com.amazonaws.services.dynamodbv2.model.AttributeValue;
-import com.amazonaws.services.dynamodbv2.model.PutItemRequest;
-import com.amazonaws.services.dynamodbv2.model.ResourceNotFoundException;
+import com.amazonaws.services.dynamodbv2.document.DynamoDB;
+import com.amazonaws.services.dynamodbv2.document.Item;
+import com.amazonaws.services.dynamodbv2.document.Table;
+import com.amazonaws.services.dynamodbv2.model.*;
 import com.amazonaws.services.lambda.runtime.Context;
 import com.amazonaws.services.lambda.runtime.RequestHandler;
 import com.amazonaws.services.lambda.runtime.events.SNSEvent;
@@ -14,14 +15,19 @@ import com.google.common.collect.Lists;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import org.apache.commons.io.FileUtils;
+import org.joda.time.format.DateTimeFormat;
 
 import java.io.*;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Paths;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.UUID;
 
 /**
  * @Author: Xiaosong Zhai
@@ -116,17 +122,38 @@ public class SnsEventHandler implements RequestHandler<SNSEvent,String> {
     }
 
     private void trackEmailStatus(String userEmail, String status, Context context) {
-        AmazonDynamoDB ddb = AmazonDynamoDBClientBuilder.defaultClient();
-        HashMap<String, AttributeValue> item = new HashMap<>();
-        item.put("email", new AttributeValue(userEmail));
-        item.put("timestamp", new AttributeValue().withN(Long.toString(System.currentTimeMillis())));
-        item.put("Status", new AttributeValue(status));
-        PutItemRequest putItemRequest = new PutItemRequest()
-                .withTableName(DYNAMODB_TABLE_NAME)
-                .withItem(item);
+        AmazonDynamoDB client = AmazonDynamoDBClientBuilder.standard().build();
+        // create a DynamoDB
+        DynamoDB dynamoDB = new DynamoDB(client);
+
+        boolean contains = client.listTables().getTableNames().contains(DYNAMODB_TABLE_NAME);
+
+        if (!contains) {
+            CreateTableRequest createTableRequest = new CreateTableRequest()
+                    .withTableName(DYNAMODB_TABLE_NAME)
+                    .withKeySchema(new KeySchemaElement("emailId", KeyType.HASH))
+                    .withAttributeDefinitions(new AttributeDefinition("emailId", ScalarAttributeType.S))
+                    .withProvisionedThroughput(new ProvisionedThroughput(1L, 1L));
+            CreateTableResult createTableResult = client.createTable(createTableRequest);
+
+            Table table = dynamoDB.getTable(DYNAMODB_TABLE_NAME);
+
+            try {
+                table.waitForActive();
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+        }
+
+        Table table = dynamoDB.getTable(DYNAMODB_TABLE_NAME);
+
+        Item item = new Item()
+                .withPrimaryKey("email", UUID.randomUUID().toString())
+                .withString("email", userEmail)
+                .withString("status", status)
+                .withString("timeStamp", DateTimeFormatter.ISO_INSTANT.format(Instant.now().atOffset(ZoneOffset.UTC)));
         try {
-            ddb.putItem(putItemRequest);
-            System.out.println( DYNAMODB_TABLE_NAME +" was successfully updated");
+            table.putItem(item);
             context.getLogger().log("DynamoDB table updated");
 
         } catch (ResourceNotFoundException e) {
