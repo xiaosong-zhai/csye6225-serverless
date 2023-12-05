@@ -23,7 +23,7 @@ public class MailSender {
      * send mail to user
      * @param userEmail userEmail
      */
-    public static void sendMail(String apiKay,String userEmail, String content) {
+    public static boolean sendMail(String apiKay,String userEmail, String content) {
 
         Properties props = new Properties();
         props.put("mail.smtp.auth", "true");
@@ -45,8 +45,11 @@ public class MailSender {
             message.setText(content);
             Transport.send(message);
             System.out.println("Email Message Sent Successfully");
+            return true;
         } catch (Exception e) {
             e.printStackTrace();
+            System.out.println("Email Message Sent Failed");
+            return false;
         }
     }
 

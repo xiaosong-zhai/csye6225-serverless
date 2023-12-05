@@ -1,9 +1,11 @@
 package northeastern.xiaosongzhai;
 
+import com.amazonaws.AmazonServiceException;
 import com.amazonaws.services.dynamodbv2.AmazonDynamoDB;
 import com.amazonaws.services.dynamodbv2.AmazonDynamoDBClientBuilder;
 import com.amazonaws.services.dynamodbv2.document.DynamoDB;
 import com.amazonaws.services.dynamodbv2.document.Item;
+import com.amazonaws.services.dynamodbv2.document.PutItemOutcome;
 import com.amazonaws.services.dynamodbv2.document.Table;
 import com.amazonaws.services.dynamodbv2.model.*;
 import com.amazonaws.services.lambda.runtime.Context;
@@ -15,7 +17,6 @@ import com.google.common.collect.Lists;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import org.apache.commons.io.FileUtils;
-import org.joda.time.format.DateTimeFormat;
 
 import java.io.*;
 import java.net.URL;
@@ -38,6 +39,7 @@ public class SnsEventHandler implements RequestHandler<SNSEvent,String> {
 
     private static final String FILE_PATH = "/tmp";
     private static final String PROJECT_ID = "csye6225-demo-406000";
+    private static final String BUCKET_NAME = "csye6225-demo-bucket";
     private static final String DYNAMODB_TABLE_NAME = "emailTrackingTable";
 
     @Override
@@ -72,23 +74,25 @@ public class SnsEventHandler implements RequestHandler<SNSEvent,String> {
 
     private void processSubmission(String submissionUrl, String userEmail, String fileName, Context context) {
         try {
-            boolean downloadSuccessful = downloadFile(submissionUrl, fileName, context);
-            if (downloadSuccessful) {
-                GoogleCredentials credentials = getGoogleCredentials(context);
-                String bucketName = getBucketName(credentials, context);
-                uploadObject(bucketName, fileName, credentials);
+            String downloadSuccessful = downloadFile(submissionUrl, fileName, context);
+            boolean downloadSuccessfulBoolean = downloadSuccessful.equals("Success");
+            context.getLogger().log("downloadSuccessful: " + downloadSuccessful);
 
-                Map<String, String> objectDetails = getObjectDetails(credentials, bucketName, fileName);
-                boolean emailSent = sendSuccessEmail(userEmail, objectDetails, context);
-                trackEmailStatus(userEmail, emailSent ? "success" : "failed", context);
+            GoogleCredentials credentials = getGoogleCredentials(context);
+            context.getLogger().log("credentials: " + credentials);
+
+            if (downloadSuccessfulBoolean) {
+                uploadObject(BUCKET_NAME, fileName, credentials);
+                context.getLogger().log("uploaded" + fileName + "to bucket");
+                Map<String, String> objectDetails = getObjectDetails(credentials, BUCKET_NAME, fileName);
+                sendSuccessEmail(userEmail, objectDetails, context);
+                context.getLogger().log("Sent success mail to user: " + userEmail);
             } else {
-                sendFailureEmail(userEmail, context);
-                trackEmailStatus(userEmail, "failed", context);
+                sendFailureEmail(userEmail, context, downloadSuccessful);
+                context.getLogger().log("sent fail mail to user: " + userEmail);
             }
         } catch (Exception e) {
             context.getLogger().log("Error processing submission: " + e.getMessage());
-            sendFailureEmail(userEmail, context);
-            trackEmailStatus(userEmail, "failed", context);
         }
     }
 
@@ -122,71 +126,66 @@ public class SnsEventHandler implements RequestHandler<SNSEvent,String> {
     }
 
     private void trackEmailStatus(String userEmail, String status, Context context) {
-        AmazonDynamoDB client = AmazonDynamoDBClientBuilder.standard().build();
-        // create a DynamoDB
-        DynamoDB dynamoDB = new DynamoDB(client);
 
-        boolean contains = client.listTables().getTableNames().contains(DYNAMODB_TABLE_NAME);
+        try{
+            AmazonDynamoDB client = AmazonDynamoDBClientBuilder.standard().build();
+            // create a DynamoDB
+            DynamoDB dynamoDB = new DynamoDB(client);
 
-        if (!contains) {
-            CreateTableRequest createTableRequest = new CreateTableRequest()
-                    .withTableName(DYNAMODB_TABLE_NAME)
-                    .withKeySchema(new KeySchemaElement("emailId", KeyType.HASH))
-                    .withAttributeDefinitions(new AttributeDefinition("emailId", ScalarAttributeType.S))
-                    .withProvisionedThroughput(new ProvisionedThroughput(1L, 1L));
-            CreateTableResult createTableResult = client.createTable(createTableRequest);
+            boolean contains = client.listTables().getTableNames().contains(DYNAMODB_TABLE_NAME);
+            context.getLogger().log("contains: " + contains);
+
+            if (!contains) {
+                CreateTableRequest createTableRequest = new CreateTableRequest()
+                        .withTableName(DYNAMODB_TABLE_NAME)
+                        .withKeySchema(new KeySchemaElement("emailId", KeyType.HASH))
+                        .withAttributeDefinitions(new AttributeDefinition("emailId", ScalarAttributeType.S))
+                        .withProvisionedThroughput(new ProvisionedThroughput(1L, 1L));
+                CreateTableResult createTableResult = client.createTable(createTableRequest);
+
+                Table table = dynamoDB.getTable(DYNAMODB_TABLE_NAME);
+
+                try {
+                    table.waitForActive();
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+            }
 
             Table table = dynamoDB.getTable(DYNAMODB_TABLE_NAME);
 
-            try {
-                table.waitForActive();
-            } catch (InterruptedException e) {
-                e.printStackTrace();
-            }
-        }
+            Item item = new Item()
+                    .withPrimaryKey("emailId", UUID.randomUUID().toString())
+                    .withString("email", userEmail)
+                    .withString("status", status)
+                    .withString("timeStamp", DateTimeFormatter.ISO_INSTANT.format(Instant.now().atOffset(ZoneOffset.UTC)));
 
-        Table table = dynamoDB.getTable(DYNAMODB_TABLE_NAME);
-
-        Item item = new Item()
-                .withPrimaryKey("email", UUID.randomUUID().toString())
-                .withString("email", userEmail)
-                .withString("status", status)
-                .withString("timeStamp", DateTimeFormatter.ISO_INSTANT.format(Instant.now().atOffset(ZoneOffset.UTC)));
-        try {
-            table.putItem(item);
-            context.getLogger().log("DynamoDB table updated");
-
-        } catch (ResourceNotFoundException e) {
-            System.err.format("Error: The Amazon DynamoDB table \"%s\" can't be found.\n", DYNAMODB_TABLE_NAME);
-            System.err.println("Be sure that it exists and that you've typed its name correctly!");
-            context.getLogger().log("Error: The Amazon DynamoDB table \"%s\" can't be found.\n" + DYNAMODB_TABLE_NAME);
-            System.exit(1);
-        } catch (Exception e) {
-            System.err.println("Error: " + e.getMessage());
-            context.getLogger().log("Error: " + e.getMessage());
-            System.exit(1);
+            PutItemOutcome putItemOutcome = table.putItem(item);
+            context.getLogger().log("DynamoDB table updated" + putItemOutcome);
+        } catch (AmazonServiceException e) {
+            e.printStackTrace();
         }
     }
 
-    private static String getBucketName(GoogleCredentials credentials, Context context) {
-        Storage storage = StorageOptions.newBuilder()
-                .setCredentials(credentials)
-                .setProjectId(SnsEventHandler.PROJECT_ID)
-                .build()
-                .getService();
-        System.out.println("storage: " + storage);
-
-        String bucketName = "";
-        // list buckets in the project
-        context.getLogger().log("My buckets:");
-        for (Bucket bucket : storage.list().iterateAll()) {
-            System.out.println(bucket.toString());
-            if (bucket.getName().startsWith("csye6225-")) {
-                bucketName = bucket.getName();
-            }
-        }
-        return bucketName;
-    }
+//    private static String getBucketName(GoogleCredentials credentials, Context context) {
+//        Storage storage = StorageOptions.newBuilder()
+//                .setCredentials(credentials)
+//                .setProjectId(SnsEventHandler.PROJECT_ID)
+//                .build()
+//                .getService();
+//        System.out.println("storage: " + storage);
+//
+//        String bucketName = "";
+//        // list buckets in the project
+//        context.getLogger().log("My buckets:");
+//        for (Bucket bucket : storage.list().iterateAll()) {
+//            System.out.println(bucket.toString());
+//            if (bucket.getName().startsWith("csye6225-")) {
+//                bucketName = bucket.getName();
+//            }
+//        }
+//        return bucketName;
+//    }
 
     private static Map<String,String> getObjectDetails(GoogleCredentials credentials, String bucketName, String objectName) {
         Storage storage = StorageOptions.newBuilder()
@@ -223,7 +222,7 @@ public class SnsEventHandler implements RequestHandler<SNSEvent,String> {
         return parts[parts.length - 1];
     }
 
-    private boolean downloadFile(String submissionUrl, String fileName, Context context) {
+    private String downloadFile(String submissionUrl, String fileName, Context context) {
         try {
             URL httpurl = new URL(submissionUrl);
             File dirfile = new File(FILE_PATH);
@@ -232,39 +231,48 @@ public class SnsEventHandler implements RequestHandler<SNSEvent,String> {
             }
             FileUtils.copyURLToFile(httpurl, new File(FILE_PATH + "/" + fileName));
             context.getLogger().log("Downloaded file: " + FILE_PATH + "/" + fileName);
-            return true;
+            return "Success";
         } catch (Exception e) {
             context.getLogger().log("Error downloading file: " + e.getMessage());
             e.printStackTrace();
-            return false;
+            return e.getMessage();
         }
     }
 
-    private boolean sendSuccessEmail(String userEmail, Map<String, String> objectDetails, Context context) {
-        try {
-            String apiKay = System.getenv("apiKay");
-            MailSender.sendMail(apiKay, userEmail, "Your submission has been downloaded" + "\n" +
+    private void sendSuccessEmail(String userEmail, Map<String, String> objectDetails, Context context) {
+        String apiKay = System.getenv("apiKay");
+        boolean sendMailSuccessful = MailSender.sendMail(apiKay, userEmail, "Your submission has been downloaded" + "\n" +
                     "objectName: " + objectDetails.get("name") + "\n" +
                     "contentType: " + objectDetails.get("contentType") + "\n" +
                     "size: " + objectDetails.get("size"));
-            context.getLogger().log("Sent mail to user: " + userEmail);
-            return true;
-        } catch (Exception e) {
-            context.getLogger().log("Error sending email: " + e.getMessage());
-            e.printStackTrace();
-            return false;
+        context.getLogger().log("sendMailSuccessful: " + sendMailSuccessful);
+        if (sendMailSuccessful){
+                context.getLogger().log("start track successful Email into dynamodb method");
+                trackEmailStatus(userEmail, "success", context);
+                context.getLogger().log("DynamoDB email success updated");
+        } else {
+                context.getLogger().log("start track fail Email into dynamodb method");
+                trackEmailStatus(userEmail, "failed", context);
+                context.getLogger().log("DynamoDB email failed updated");
         }
+        context.getLogger().log("Sent mail to user: " + userEmail);
     }
 
-    private void sendFailureEmail(String userEmail, Context context) {
-        try {
-            String apiKey = System.getenv("apiKey");
-            MailSender.sendMail(apiKey, userEmail, "Your submission download failed.");
-            context.getLogger().log("Sent failure mail to user: " + userEmail);
-        } catch (Exception e) {
-            context.getLogger().log("Error sending failure email: " + e.getMessage());
-            e.printStackTrace();
+    private void sendFailureEmail(String userEmail, Context context, String dowlnoadFailureReason) {
+        String apiKay = System.getenv("apiKay");
+        boolean sendFailureEmailSuccessful = MailSender.sendMail(apiKay, userEmail, "Your submission download failed." + "\n" +
+                "Reason: " + dowlnoadFailureReason);
+        context.getLogger().log("sendFailureEmailSuccessful: " + sendFailureEmailSuccessful);
+        if (sendFailureEmailSuccessful){
+            context.getLogger().log("start track successful Email into dynamodb method");
+            trackEmailStatus(userEmail, "success", context);
+            context.getLogger().log("DynamoDB email success updated");
+        } else {
+            context.getLogger().log("start track fail Email into dynamodb method");
+            trackEmailStatus(userEmail, "failed", context);
+            context.getLogger().log("DynamoDB email failed updated");
         }
+        context.getLogger().log("Sent failure mail to user: " + userEmail);
     }
 
     private static void uploadObject(String bucketName,
